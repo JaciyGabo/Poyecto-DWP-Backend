@@ -12,6 +12,9 @@ import speakeasy from "speakeasy";
 dotenv.config();
 
 const app = express();
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
 app.use(express.json());
 app.use(cors());
 const blacklistedTokens = new Set();
@@ -208,12 +211,11 @@ app.post("/login", async (req, res) => {
       return res.status(401).json({ message: "Credenciales incorrectas" });
     }
 
-    if(userData.verificado === 0){
-      return res.status(200).json({ requiresMFA: true, message: "Verifica tu cuenta" });
-    }
-
     const token = jwt.sign({ email, username: userData.username }, SECRET_KEY, { expiresIn: "1hr" });
 
+    if (userData.verificado === 0) {
+      return res.status(200).json({token, requiresMFA: true, message: "Verifica tu cuenta" });
+    }
     res.json({ token, message: "Inicio de sesión exitoso" });
 
 
@@ -326,9 +328,11 @@ app.post("/logout", (req, res) => {
 
 // Endpoint para guardar una imagen favorita
 app.post("/save-favorite", verifyToken, async (req, res) => {
-  const { imageUrl, text } = req.body;
+  const { imageUrl, text, hash } = req.body;
   const email = req.userEmail; // Obtener el correo del token decodificado
-
+  console.log("hash:", hash);
+  console.log("email:", email);
+  
   if (!imageUrl || !text) {
     return res.status(400).json({ message: "Faltan datos" });
   }
@@ -343,7 +347,7 @@ app.post("/save-favorite", verifyToken, async (req, res) => {
     // Verificar si ya existe en la colección de favoritos
     const favoritesRef = db.collection("favorites");
     const existingFavorite = await favoritesRef
-      .where("url", "==", imageUrl)
+      .where("hash", "==", hash)
       .where("userEmail", "==", email)
       .limit(1)
       .get();
@@ -356,6 +360,7 @@ app.post("/save-favorite", verifyToken, async (req, res) => {
     await favoritesRef.add({
       url: imageUrl,
       text,
+      hash, 
       userEmail: email,
       createdAt: new Date() // Opcional: añadir timestamp
     });
@@ -517,19 +522,112 @@ app.post("/accept-request", verifyToken, async (req, res) => {
   }
 });
 
-// Endpoint para obtener la lista de amigos     
+// Endpoint para obtener la lista de amigos con username
 app.get("/friends", verifyToken, async (req, res) => {
-  const userEmail = req.userEmail; // Obtener el correo del token decodificado
+  const userEmail = req.userEmail;
 
   try {
     const userFriendsDoc = await db.collection("userFriends").doc(userEmail).get();
 
-    const friends = userFriendsDoc.exists ? userFriendsDoc.data().friends || [] : [];
+    const friendsEmails = userFriendsDoc.exists ? userFriendsDoc.data().friends || [] : [];
 
-    res.status(200).json({ friends });
+    if (friendsEmails.length === 0) {
+      return res.status(200).json({ friends: [] });
+    }
+
+    // Obtener los usuarios con esos correos
+    const usersRef = db.collection("users");
+    const friendsQuery = await Promise.all(
+      friendsEmails.map(async (email) => {
+        const userDoc = await usersRef.doc(email).get();
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+          return {
+            email,
+            username: userData.username || "", // Puedes poner un fallback si falta
+          };
+        } else {
+          return { email, username: "" }; // En caso de que no exista el documento
+        }
+      })
+    );
+    
+    console.log("Amigos obtenidos:", friendsQuery);
+
+    res.status(200).json({ friends: friendsQuery });
   } catch (error) {
     console.error("Error al obtener amigos:", error);
     res.status(500).json({ message: "Error al obtener amigos", error: error.message });
+  }
+});
+
+app.get("/user-data", verifyToken, async (req, res) => {
+  const userEmail = req.userEmail; // Obtener el correo del token decodificado
+
+  try {
+    const userDoc = await db.collection("users").doc(userEmail).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ message: "Usuario no encontrado" });
+    }
+
+    const userData = userDoc.data();
+    res.status(200).json({ userData });
+  } catch (error) {
+    console.error("Error al obtener datos del usuario:", error);
+    res.status(500).json({ message: "Error al obtener datos del usuario", error: error.message });
+  }
+}
+);
+
+app.post("/update-profile", verifyToken, async (req, res) => {
+  const { username, password } = req.body;
+  const userEmail = req.userEmail; // Obtenido del verifyToken
+
+  try {
+    // 1. Validar datos de entrada
+    if (!username || username.length < 3) {
+      return res.status(400).json({ message: "El nombre de usuario debe tener al menos 3 caracteres" });
+    }
+
+    if (password && password.length < 3) {
+      return res.status(400).json({ message: "La contraseña debe tener al menos 3 caracteres" });
+    }
+
+    // 2. Crear objeto con los campos a actualizar
+    const updateData = { username };
+    
+    // Solo actualizar contraseña si se proporcionó
+    if (password) {
+      // Hashear la nueva contraseña antes de guardarla
+      const hashedPassword = await bcrypt.hash(password, 10);
+      updateData.password = hashedPassword;
+    }
+
+    // 3. Actualizar en Firestore
+    const userRef = db.collection("users").doc(userEmail);
+    
+    // Actualización parcial (solo los campos que cambian)
+    await userRef.update(updateData);
+
+    // 4. Responder con éxito
+    res.status(200).json({ 
+      message: "Perfil actualizado correctamente",
+      updatedFields: Object.keys(updateData)
+    });
+
+  } catch (error) {
+    console.error("Error al actualizar perfil:", error);
+    
+    // Manejar errores específicos
+    if (error.code === 'NOT_FOUND') {
+      return res.status(404).json({ message: "Usuario no encontrado" });
+    }
+    
+    res.status(500).json({ 
+      message: "Error al actualizar perfil",
+      error: error.message 
+    });
   }
 });
 
